@@ -1,8 +1,10 @@
+use crate::jira::tickets::CommentBody;
+use crate::widgets::comments::CommentsWidget;
 use crate::widgets::components::ComponentsWidget;
 use crate::widgets::description::DescriptionWidget;
 use crate::widgets::labels::LabelsWidget;
 use crate::widgets::parent::TicketParentWidget;
-use crate::widgets::ticket_relation::TicketRelationWidget;
+use crate::widgets::ticket_relation::RelationWidget;
 use crate::widgets::tickets::TicketWidget;
 use crate::{
     config::Config,
@@ -22,6 +24,7 @@ use tui::{
 // }
 
 pub enum Focus {
+    Comments,
     Components,
     Description,
     Labels,
@@ -31,6 +34,7 @@ pub enum Focus {
 }
 
 pub struct App {
+    comments: CommentsWidget,
     components: ComponentsWidget,
     description: DescriptionWidget,
     focus: Focus,
@@ -39,8 +43,8 @@ pub struct App {
     // load_state: LoadState,
     parent: TicketParentWidget,
     projects: ProjectsWidget,
+    relation: RelationWidget,
     tickets: TicketWidget,
-    ticket_relation: TicketRelationWidget,
     pub config: Config,
     pub error: ErrorComponent,
 }
@@ -51,6 +55,7 @@ impl App {
         let projects = &jira.projects.values.clone();
 
         Ok(Self {
+            comments: CommentsWidget::new(config.key_config.clone()),
             components: ComponentsWidget::new(config.key_config.clone()),
             config: config.clone(),
             description: DescriptionWidget::new(config.key_config.clone()),
@@ -61,8 +66,8 @@ impl App {
             // load_state: LoadState::Complete,
             parent: TicketParentWidget::new(),
             projects: ProjectsWidget::new(projects, config.key_config.clone()),
+            relation: RelationWidget::new(config.key_config.clone()),
             tickets: TicketWidget::new(config.key_config.clone()),
-            ticket_relation: TicketRelationWidget::new(config.key_config.clone())
         })
     }
 
@@ -88,10 +93,7 @@ impl App {
 
         let ticket_left_chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(45),
-                Constraint::Percentage(40),
-            ])
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(40)])
             .split(description_metadata[0]);
 
         let ticket_metadata_chunks = Layout::default()
@@ -99,7 +101,7 @@ impl App {
             .constraints([
                 Constraint::Percentage(40),
                 Constraint::Percentage(40),
-                Constraint::Percentage(20)
+                Constraint::Percentage(20),
             ])
             .split(ticket_left_chunks[1]);
 
@@ -114,7 +116,6 @@ impl App {
             .split(description_metadata[1]);
 
         let ticket_description = ticket_right_chunks[0];
-
 
         self.tickets
             .draw(f, matches!(self.focus, Focus::Tickets), ticket_list)?;
@@ -140,14 +141,25 @@ impl App {
             self.tickets.selected(),
         )?;
 
-        self.parent.draw(f, false, ticket_parent, self.tickets.selected())?;
+        self.parent
+            .draw(f, false, ticket_parent, self.tickets.selected())?;
 
-        self.ticket_relation.draw(
+        self.relation.draw(
             f,
             matches!(self.focus, Focus::TicketRelation),
             ticket_relation,
             self.tickets.selected(),
         )?;
+
+        if let Focus::Comments = self.focus {
+            self.comments.draw(
+                f,
+                matches!(self.focus, Focus::Projects),
+                f.size(),
+                self.tickets.selected(),
+            )?;
+            return Ok(());
+        }
 
         Ok(())
     }
@@ -169,7 +181,7 @@ impl App {
         self.tickets
             .update(
                 &self.jira.db,
-                &self.jira.auth,
+                &self.jira.client,
                 &project.key,
                 &self.jira.tickets,
             )
@@ -204,6 +216,18 @@ impl App {
         Ok(())
     }
 
+    pub async fn update_comments(&mut self) -> anyhow::Result<()> {
+        match self.tickets.selected() {
+            None => {
+                return Ok(())
+            }
+            Some(t) => {
+                t.get_comments(&self.jira.db, &self.jira.client).await?;
+            }
+        };
+        Ok(())
+    }
+
     pub async fn component_event(&mut self, key: Key) -> anyhow::Result<EventState> {
         if self.error.event(key)?.is_consumed() {
             return Ok(EventState::Consumed);
@@ -214,13 +238,15 @@ impl App {
         // }
 
         match self.focus {
+            Focus::Comments => {
+                if self.comments.event(key)?.is_consumed() {
+                    self.update_comments().await?;
+                    return Ok(EventState::Consumed);
+                }
+            }
             Focus::Components => {
                 if self.components.event(key)?.is_consumed() {
                     return Ok(EventState::Consumed);
-                }
-
-                if key == self.config.key_config.focus_below {
-                    self.focus = Focus::TicketRelation
                 }
             }
             Focus::Description => {
@@ -248,7 +274,7 @@ impl App {
                 }
             }
             Focus::TicketRelation => {
-                if self.ticket_relation.event(key)?.is_consumed() {
+                if self.relation.event(key)?.is_consumed() {
                     return Ok(EventState::Consumed);
                 }
             }
@@ -274,20 +300,38 @@ impl App {
         }
 
         match self.focus {
+            Focus::Comments => {
+                if key == self.config.key_config.exit_popup {
+                    self.focus = Focus::Tickets
+                }
+            }
             Focus::Components => {
                 if key == self.config.key_config.focus_above {
                     self.focus = Focus::Labels;
                     return Ok(EventState::Consumed);
                 }
+
+                if key == self.config.key_config.focus_below {
+                    self.focus = Focus::TicketRelation
+                }
+
                 if key == self.config.key_config.focus_right {
                     self.focus = Focus::Description;
                     return Ok(EventState::Consumed);
+                }
+
+                if key == self.config.key_config.focus_comments {
+                    self.focus = Focus::Comments;
                 }
             }
             Focus::Description => {
                 if key == self.config.key_config.focus_left {
                     self.focus = Focus::Tickets;
                     return Ok(EventState::Consumed);
+                }
+
+                if key == self.config.key_config.focus_comments {
+                    self.focus = Focus::Comments;
                 }
             }
             Focus::Labels => {
@@ -303,6 +347,10 @@ impl App {
                     self.focus = Focus::Description;
                     return Ok(EventState::Consumed);
                 }
+
+                if key == self.config.key_config.focus_comments {
+                    self.focus = Focus::Comments;
+                }
             }
             Focus::Projects => {
                 if key == self.config.key_config.enter {
@@ -315,6 +363,10 @@ impl App {
                     self.focus = Focus::Components;
                     return Ok(EventState::Consumed);
                 }
+
+                if key == self.config.key_config.focus_comments {
+                    self.focus = Focus::Comments;
+                }
             }
             Focus::Tickets => {
                 if key == self.config.key_config.focus_below {
@@ -324,6 +376,10 @@ impl App {
                 if key == self.config.key_config.focus_right {
                     self.focus = Focus::Description;
                     return Ok(EventState::Consumed);
+                }
+
+                if key == self.config.key_config.focus_comments {
+                    self.focus = Focus::Comments;
                 }
             }
         }
